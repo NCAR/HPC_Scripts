@@ -1,0 +1,10 @@
+#!/bin/bash
+[ -z "$1" ] && echo "$0 {src file} {syslog tag} {flock file}" && exit 1
+[ ! -f "$1" ] && echo "source file $1 does not exist on this system" && exit 1
+
+if [ "$4" != "nolock" ]  
+then
+	(nohup flock -xn $3 -c "$0 $1 $2 $3 nolock" 0<&- &>/dev/null &) &
+else
+	/usr/bin/tail -n 100 -F "$1" 2>/dev/null | /usr/bin/logger -t "$2"
+fi

@@ -1,0 +1,44 @@
+#!/usr/bin/php
+<?php
+ini_set('display_errors', 'On');
+error_reporting(E_ALL);
+date_default_timezone_set('America/Denver');
+
+{ 
+    $srcf = fopen('php://stdin', 'r');
+    if(!is_resource($srcf))
+	die('unable to open src file');
+
+    while(!feof($srcf))
+    {
+	$line = fgets($srcf);
+	#syslog comes in two formats
+	#Jan  1 01:01:36 ysmgt2 ibhealthreport: ibnetdiscover: 'MF0;ys72ib1:SXX536/L28/U1'(389/2) <->  'MF0;ys59ib3:SX60XX/U1'(5077/24) : link speed = FDR10 !=  FDR
+	#2013-05-31T07:53:15-06:00 pr0222 kernel: Waiting for MIC 0 boot 1470
+	if(preg_match('/^((\S+)\s+\S+\s+\d+:\d+:\d+)\s+(\w+)\s+(\w+)(\[\d+\]|):\s+/', $line, $match))
+	{
+	    #var_dump($match); continue;
+
+            #hack: year not given by syslog data with older format, so we just assume the year
+	    $year = 2013;
+	    if($match[2] == "Nov" || $match[2] == "Dec" || $match[2] == "Oct")
+		$year = 2012;
+	    $timestamp = strtotime($match[1]." ".$year);
+
+	    print $timestamp . " " . $line;
+	} 
+	else if(preg_match('/^(\d+-\d+-\d+T\d+:\d+:\d+(|\.\d+)-\d+:\d+)\s+/', $line, $match))
+	{
+	    $timestamp = strtotime($match[1]);
+
+	    print $timestamp . " " . $line;
+	} else if($line != "")
+	{
+	    die('fail:'.$line); 
+	}
+    }
+
+    fclose($srcf);
+}
+
+?>

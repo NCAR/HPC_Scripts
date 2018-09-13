@@ -1,0 +1,3 @@
+#!/bin/bash
+
+/ssg/bin/syslogtimestamp | sort -snk1

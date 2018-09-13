@@ -1,0 +1,13 @@
+#!/bin/bash
+export PATH=/ssg/bin/:$PATH
+[ -z "$1" ] && echo "$0 {node name}
+Get the console logs from a given node
+" >&2 && exit 1
+
+nodeset -S "\n" -e "$1" | while read NODE
+do
+    LEAD="$(get_lead "$NODE")"
+    [ -z "$LEAD" ] && echo "unknown host $NODE lead" && exit 1
+
+    ssh $LEAD "strings /var/log/consoles/$NODE" | less -S +G 
+done
