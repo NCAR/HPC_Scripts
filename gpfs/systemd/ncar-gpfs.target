@@ -1,0 +1,9 @@
+[Unit]
+Description=NCAR GPFS target
+Requires=ncar-gpfs-mount.service ncar-gpfs-startup.service ncar-gpfsmond.service
+After=ncar-gpfs-mount.service ncar-gpfs-startup.service ncar-gpfsmond.service
+Conflicts=shutdown.target
+Wants=system.slice
+[Install]
+WantedBy=multi-user.target
+Alias=gpfs.target

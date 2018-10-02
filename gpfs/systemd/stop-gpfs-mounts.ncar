@@ -1,0 +1,25 @@
+#!/bin/bash
+
+mounts=$(awk '$3 == "gpfs" {print $2}' < /proc/mounts | wc -l)
+/usr/bin/logger -t stop-gpfs-mounts "begin: unmounting $mounts mounts"
+
+killusers (){
+    for i in {1..5}
+    do
+        awk '$3 == "gpfs" {print $2}' < /proc/mounts | xargs -i fuser -KILL -skm {}
+        true
+    done
+}
+
+awk '$3 == "gpfs" {print $2}' < /proc/mounts | xargs -i mount -o remount,ro {}
+killusers
+/usr/lpp/mmfs/bin/mmumount all -f
+killusers
+/usr/lpp/mmfs/bin/mmumount all -f
+killusers
+awk '$3 == "gpfs" {print $2}' < /proc/mounts | xargs -i umount -f {}
+
+mounts=$(awk '$3 == "gpfs" {print $2}' < /proc/mounts | wc -l)
+/usr/bin/logger -t stop-gpfs-mounts "end: $mounts mounts survived"
+
+exit 0

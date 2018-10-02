@@ -1,0 +1,19 @@
+#!/bin/bash
+
+/usr/sbin/stop-gpfs-mounts.ncar 
+
+/usr/bin/logger -t stop-gpfs "shutting down gpfs"
+/usr/lpp/mmfs/bin/mmshutdown -t 15 --noforce
+
+/sbin/lsmod | grep mmfs 2>&1 >/dev/null
+[ $? -eq 0 ] && /usr/lpp/mmfs/bin/mmshutdown --force
+
+/sbin/lsmod | grep mmfs 2>&1 >/dev/null
+if [ $? -eq 0 ]
+then
+    /usr/bin/logger -t stop-gpfs "error: gpfs kmods survived"
+else
+    /usr/bin/logger -t stop-gpfs "gpfs kmods removed"
+fi
+
+exit 0

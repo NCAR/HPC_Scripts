@@ -1,0 +1,21 @@
+[Unit]
+Description=NCAR gpfsmond
+ConditionFileIsExecutable=/usr/sbin/gpfsmond
+After=network.target ncar-gpfs-mount.service
+Requires=ncar-gpfs-mount.service 
+PartOf=ncar-gpfs.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/gpfsmond --extension /usr/sbin/gpfsmond.d/
+ExecStop=/usr/sbin/gpfsmond --extension /usr/sbin/gpfsmond.d/
+ExecStartPost=/usr/sbin/check_gpfsmond.ncar 80
+TimeoutSec=2200
+TimeoutStopSec=2200
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=30
+MemoryAccounting=true
+
+[Install]
+Alias=gpfsmond.service

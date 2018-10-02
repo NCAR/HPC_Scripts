@@ -1,0 +1,21 @@
+[Unit]
+Description=mmmount
+ConditionFileIsExecutable=/usr/lpp/mmfs/bin/mmstartup
+After=network.target ncar-gpfs-startup.service
+Requires=ncar-gpfs-startup.service
+PartOf=ncar-gpfs.target
+
+[Service]
+Type=forking
+ExecStartPre=/usr/sbin/check_mmgetstate.ncar
+ExecStart=/usr/lpp/mmfs/bin/mmmount all
+ExecStop=/usr/sbin/stop-gpfs-mounts.ncar 
+TimeoutSec=2400
+TimeoutStopSec=2400
+RemainAfterExit=yes
+Restart=no
+RestartSec=30
+MemoryAccounting=true
+
+[Install]
+Alias=gpfs-mount.service

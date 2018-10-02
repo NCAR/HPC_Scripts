@@ -1,0 +1,36 @@
+#!/bin/bash
+#Quick tool to check if this node is considered active in GPFS
+[ -z "$1" ] && echo "$0 {check attempt counts}" && exit 1
+
+function check(){
+    #make sure that gpfsgood exists and has been updated in the past 10 minutes
+    #gpfsmond is supposed to update every 2 minutes
+    if [ -s /var/run/gpfsgood ]
+    then
+	if [ "$(cat /var/run/gpfsgood)" -gt "$(date -d "-10 min" +%s)" ]
+	then
+	    echo "GPFS marked as good by gpfsmond" >&2
+	    exit 0
+	fi
+    fi
+
+    return 1
+}
+
+attempts="$1"
+if [ "$attempts" -eq 1 ]
+then
+    check
+    exit $?
+else
+    for (( i=1; i<attempts; i++))
+    do
+	check
+	echo "Attempt $i of $attempts failed" >&2
+	[ "$i" -gt 0 ] && sleep 10
+    done
+
+    echo "GPFS never marked as good by gpfsmond. failing out." >&2
+
+    exit 1
+fi
