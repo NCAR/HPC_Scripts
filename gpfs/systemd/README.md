@@ -16,7 +16,7 @@ chmod 0755 /usr/sbin/check_gpfsmond.ncar /usr/sbin/check_mmgetstate.ncar /usr/sb
 ```
 3. Test new unit files
 ```bash     
-  systemctl sttart ncar-gpfs.target
+  systemctl start ncar-gpfs.target
 ```
 4. Activate new unit files
 ```bash     
