@@ -1,0 +1,439 @@
+#!/usr/bin/perl
+use lib '/ncar/ssg/cpan/';
+use Fcntl ':flock';
+use IPC::Run qw( run timeout );
+use Switch;
+use Env qw(@PATH);
+use vars qw/ %opt /;
+use Getopt::Std;
+use Config::Scoped;
+use File::Spec;
+use File::Basename;
+use strict;
+use warnings;
+
+my $opt_string = 'c:t:n:';
+getopts( "$opt_string", \%opt ) or die "
+gen_nagios {-c file} {-n ssg|cpg}
+-c {config file}\tPath to Config File
+-t {ssg|cpg}\tOutput Nagios config for SSG or CPG
+-n {nagios server}\tFilter everything for a given nagios server
+";
+
+die "config file not provided" unless exists $opt{c} && $opt{c} ne "";
+my $config = $opt{c}; 
+my $type = lc($opt{t}); #SSG|CPG
+my $nagiosfilter = $opt{n}; #nagios server to filter against
+my %groups = (); # name -> @members
+my %allmembers = (); # name -> 1 list of all known members for all proximity
+my %hosts = (); #list of hosts 
+my %dhosts = (); #list of hosts dumped
+my %dshosts = (); #list of hosts dumped with services
+my $hostpfilter = ''; #positive filter for nagios
+my $hostnfilter = ''; #negative filter for nagios
+my %sev1 = (); # host => { service => 1 } All services to be added to SEV1
+
+my $cfg_warnings = { 
+    declaration  => 'on',  # or 'on'
+    digests      => 'on',
+    macro        => 'on',
+    parameter    => 'on',
+    permissions  => 'off' #fix this later, but need it off for code dev
+};
+
+my $cfg = Config::Scoped->new( file => $config, warnings => $cfg_warnings )->parse;
+die "Could not read config: $config \n" unless ref $cfg;
+
+{ #parse out the groups from cfg groups
+    foreach(keys(%{$cfg->{groups}}))
+    {
+	my $group = $_;
+	$groups{$group} = [ @{$cfg->{groups}{$group}} ];
+	foreach(@{$cfg->{groups}{$group}})
+	{
+	    $allmembers{$_} = 1;
+	}
+    }
+    delete $cfg->{groups};
+}
+
+die "global states not set" unless exists $cfg->{global}{states};
+die "global sensordirectory not set" unless exists $cfg->{global}{sensordirectory};
+die "global remotecmd not set" unless exists $cfg->{global}{remotecmd};
+die "global lock not set" unless exists $cfg->{global}{lock};
+
+# bool  isHostSelected(string grouplist, string thost)
+sub isHostSelected
+{
+    die "missing ops $!" unless defined $_[0] && defined $_[1];
+
+    my @filters = @{$_[0]};
+    my $thost = $_[1];
+    foreach my $filter (@filters)
+    {
+        return 1 if lc($filter) eq "all"; #all groups allowed?
+        return 1 if $filter eq $thost; #direct string match (possibly hostname or 'local')
+        return 1 if defined $groups{$filter} && grep {$_ eq $thost} @{$groups{$filter}}; #is filter a group name and is host a member of that group
+    }
+    return 0;
+}
+ 
+#bool cpgExclude($sensor_name, $nagios_host)
+#sensor can be ""
+sub cpgExclude
+{
+    my ($sensor, $nhost) = @_;
+
+    if(exists $cfg->{nagios} && exists $cfg->{nagios}{cpg} && exists $cfg->{nagios}{cpg}{exclude})
+    {
+	if($nhost ne "" && exists $cfg->{nagios}{cpg}{exclude}{hosts})
+	{
+	    return 1 if isHostSelected($cfg->{nagios}{cpg}{exclude}{hosts}, $nhost);
+	}
+	if($sensor ne "" && exists $cfg->{nagios}{cpg}{exclude}{sensors})
+	{
+	    return 1 if grep {$_ eq $sensor} @{$cfg->{nagios}{cpg}{exclude}{sensors}};
+	}
+    } 
+
+    return 0;
+}
+
+
+sub dumpSensors
+{
+    foreach(keys(%{$cfg->{sensors}}))
+    {
+		my $name = $_;
+		my %sensor = %{$cfg->{sensors}{$name}};
+
+		next unless exists $sensor{nagios};
+		next unless exists $sensor{nagios}{hosts};
+		next if $sensor{nagios}{hosts}[0] eq "-";
+		next if $sensor{type} eq "host";
+
+		#is sensor cpg excluded
+		my $cpgexcl = cpgExclude($name, ""); 
+		next if $type eq "cpg" && $cpgexcl; 
+
+		my %shosts = ();
+		foreach(@{$sensor{nagios}{hosts}})
+		{
+			my $host = $_;
+			if(exists $groups{$host})
+			{
+				foreach(@{$groups{$host}})
+				{
+					$shosts{$_} = 1;
+				}
+			}
+			else #normal host
+			{
+				$shosts{$host} = 1;
+			}
+		}
+		my $hostlist = "";
+		foreach(keys(%shosts))
+		{
+		    next if $type eq "cpg" && cpgExclude("", $_); 
+		    next unless exists $hosts{$_};
+			$hostlist .= "," if $hostlist ne "";
+			$hostlist .= $_;
+			$dshosts{$_} = 1;
+		}
+		next if $hostlist eq "";
+		my $nagios_name = $name;
+		$nagios_name = $sensor{nagios}{name} if exists $sensor{nagios}{name} && $sensor{nagios}{name} ne "-";
+		$nagios_name = $cfg->{nagios}{cluster}{short} ."_". $nagios_name;
+		$nagios_name = $sensor{nagios}{absolute_name} if exists $sensor{nagios}{absolute_name} && $sensor{nagios}{absolute_name} ne "-";
+		my $nagios_link = "http://localhost";
+		$nagios_link = $sensor{nagios}{link} if exists $sensor{nagios}{link} && $sensor{nagios}{link} ne "-";
+
+		my $check_command = 'SSG_NSCA_TIMEOUT';
+		$check_command = $sensor{nagios}{command} if exists $sensor{nagios}{command} && $sensor{nagios}{command} ne "-";
+         	my $freshness_threshold = '4500';
+		$freshness_threshold = $sensor{nagios}{freshness_threshold} if exists $sensor{nagios}{command} && $sensor{nagios}{freshness_threshold} ne "-";
+          	my $active_checks_enabled = '0';
+		$active_checks_enabled = $sensor{nagios}{active_checks_enabled} if exists $sensor{nagios}{command} && $sensor{nagios}{active_checks_enabled} ne "-";
+
+		#extract out list of SEV1 services against each host
+		if(exists $sensor{nagios}{sev1})
+		{
+		    foreach(@{$sensor{nagios}{sev1}})
+		    {
+			    my $host = $_;
+			    if(exists $groups{$host})
+			    {
+				    foreach(@{$groups{$host}})
+				    {
+					    $sev1{$_}{$nagios_name} = 1;
+				    }
+			    }
+			    else #normal host
+			    {
+				    $sev1{$host}{$nagios_name} = 1;
+			    }
+		    } 
+		}
+
+		print "
+define service{
+        register                        1
+        host_name                       $hostlist
+        service_description             $nagios_name
+        display_name                    $nagios_name
+        contact_groups                  ssg
+        notification_options            w,u,c,r,f,s
+        notification_interval           120
+        first_notification_delay        0
+        notifications_enabled           1
+        check_freshness                 1
+        freshness_threshold             $freshness_threshold
+        check_command                   $check_command
+        max_check_attempts              1
+        notification_interval           60
+        active_checks_enabled           $active_checks_enabled  ; Active service checks are enabled
+        passive_checks_enabled          1       ; Passive service checks are enabled/accepted
+        parallelize_check               0       ; Active service checks should be parallelized (disabling this can lead to major perform ance problems)
+        obsess_over_service             1       ; We should obsess over this service (if necessary)
+        notifications_enabled           1       ; Service notifications are enabled
+        event_handler_enabled           1       ; Service event handler is enabled
+        flap_detection_enabled          0       ; Flap detection is enabled
+        failure_prediction_enabled      1       ; Failure prediction is enabled
+        process_perf_data               0       ; Process performance data
+        retain_status_information       1       ; Retain status information across program restarts
+        retain_nonstatus_information    1       ; Retain non-status information across program restarts
+        is_volatile                     0
+        check_period                    SSG_24x7
+        normal_check_interval           5
+        retry_check_interval            1
+        notification_period             SSG_24x7
+        notes_url                       $nagios_link
+    } ";
+
+
+    }
+}
+
+sub dumpHost
+{
+    my $host = $_[0];
+
+    #filter the nagios hosts
+    return if $hostpfilter ne "" && $host !~ m/$hostpfilter/;
+    return if $hostnfilter ne "" && $host =~ m/$hostnfilter/;
+
+    return if exists $hosts{$host};
+    return if exists $hosts{$host};
+    $hosts{$host} = 1;
+    #is host cpg excluded
+    my $cpgexcl = cpgExclude("", $host); 
+    return if $type eq "cpg" && $cpgexcl;
+
+    my $check = "SSG_NSCA_TIMEOUT";
+    my $link = "http://localhost"; #should always be set later
+    my $activecheck = "0";
+    my $address = ""; #should be set if active checks used
+    my $contacts = "ssg";
+    $contacts .= ",readonly" if !$cpgexcl;
+
+    if(exists $cfg->{nagios}{hosts})
+    {
+	foreach my $nhost (keys %{$cfg->{nagios}{hosts}})
+	{
+	    my @prox = ($nhost);
+	    next unless isHostSelected(\@prox, $host);
+ 
+	    $check = $cfg->{nagios}{hosts}{$nhost}{command};
+	    $address = $cfg->{nagios}{hosts}{$nhost}{ip} if defined $cfg->{nagios}{hosts}{$nhost}{ip};
+	    $link = $cfg->{nagios}{hosts}{$nhost}{link}; 
+	    $activecheck = "1"; 
+
+	    if(defined $cfg->{nagios}{hosts}{$nhost}{sev1})
+	    {
+		$sev1{$host} = () unless exists $sev1{$host};
+	    }
+	} 
+    }
+
+    #find host in sensors
+    if($activecheck ne "1")
+    {
+	foreach(keys(%{$cfg->{sensors}}))
+	{
+	    my $name = $_;
+	    my %sensor = %{$cfg->{sensors}{$name}};
+
+	    next unless $sensor{type} eq "host";
+	    next unless exists $sensor{nagios};
+	    next unless exists $sensor{nagios}{hosts};
+	    next if $sensor{nagios}{hosts}[0] eq "-";
+	    next unless isHostSelected($sensor{nagios}{hosts}, $host);
+	    
+	    $link = $sensor{nagios}{link} if exists $sensor{nagios}{link};
+	}
+    }
+
+    $address = "address\t\t$address" if $address ne "";
+    my $icon = "";
+    $icon = $cfg->{nagios}{cpg}{icon} if $type eq "cpg" && exists $cfg->{nagios}{cpg}{icon};
+
+#todo: use template for this part
+    print "
+define host {
+        register                        1
+        host_name                       $host
+        $address
+	$icon
+        event_handler_enabled           1
+        flap_detection_enabled          0
+        failure_prediction_enabled      0
+        process_perf_data               0
+        retain_status_information       1
+        retain_nonstatus_information    1
+        contact_groups                  $contacts
+        notification_options            d,u,r,f,s
+        notification_interval           120
+        notification_period             SSG_24x7
+        first_notification_delay        0
+        notifications_enabled           1
+        check_freshness                 1
+        freshness_threshold             12000
+        check_command                   $check
+        active_checks_enabled           $activecheck
+        max_check_attempts              10
+        notes_url                       $link
+}";
+
+	$dhosts{$host} = 1;
+}
+ 
+sub dumpHosts
+{
+    #dump any standalone hosts
+    foreach(keys %{$cfg->{nagios}{hosts}})
+    {
+            dumpHost($_) unless exists $groups{$_};
+    }
+
+    #dump hosts if in group
+    foreach(keys %groups)
+    {
+        my $group = $_;
+        foreach(@{$groups{$group}})
+        {
+            dumpHost($_);
+        }
+    }
+}   
+
+sub dumpGroups
+{
+    foreach(keys %groups)
+    {
+        my $group = $_;
+        my $members = "";
+        foreach(@{$groups{$group}})
+        {
+	    #is host cpg excluded
+	    my $cpgexcl = cpgExclude("", $_); 
+	    next if $type eq "cpg" && $cpgexcl; 
+	    next unless exists $hosts{$_};
+
+            $members .= "," if $members ne "";
+            $members .= $_;
+        }
+        next if $members eq "";
+        $group = $cfg->{nagios}{cluster}{long} ."_". $group;
+
+        print "
+define hostgroup {
+        register                        1
+        hostgroup_name   $group
+        alias            $group
+        members          $members
+} ";
+    }
+}
+
+#determine the host filter if nagios server is set
+if($nagiosfilter ne "")
+{
+    my $found = 0;
+    foreach my $srv (keys(%{$cfg->{nagios}{ncsa}{$type}}))
+    {
+	if($srv ne "command" && $nagiosfilter eq $srv)
+	{
+	    $found = 1;
+	    $hostpfilter = $cfg->{nagios}{ncsa}{$type}{$srv}{host_regex} if exists $cfg->{nagios}{ncsa}{$type}{$srv}{host_regex};
+	    $hostnfilter = $cfg->{nagios}{ncsa}{$type}{$srv}{not_host_regex} if exists $cfg->{nagios}{ncsa}{$type}{$srv}{not_host_regex};
+	}
+    }
+
+    die "nagios filter $nagiosfilter not found" if !$found;
+}
+
+dumpHosts;
+dumpGroups;
+dumpSensors;
+
+#HACK job since CASG demands all hosts have a service
+#we create a fake service exactly how instructed
+if($type eq "cpg")
+{
+    my $members = "";
+    foreach(keys %dhosts)
+    {
+	next if exists $dshosts{$_};
+	$members .= "," if $members ne "";
+	$members .= $_;
+    } 
+
+    print "
+# dummy_check for Host only system checks
+define service{ 
+       use                             casg-generic-service 
+       service_description             Yellowstone Host_Only_Checks
+       check_command                   host_only_check
+       host_name         		$members
+       normal_check_interval           1500 #about 1 day + 1 hour
+       notification_interval           2500
+} " if $members ne "";
+}
+
+if($type eq "ssg" and %sev1)
+{
+    my $hmembers = "";
+    my $smembers = "";
+    foreach my $host (keys %sev1)
+    {
+	$hmembers .= "," if $hmembers ne "";
+	$hmembers .= $host;
+
+	foreach my $src (keys %{$sev1{$host}})
+	{
+	    $smembers .= "," if $smembers ne "";
+	    $smembers .= $host .",". $src;
+	}
+    }
+
+    my $sname = $cfg->{nagios}{cluster}{short} ."_SEV1";
+
+  print "
+#SEV1 Host List
+define hostgroup {
+        register                        1
+        hostgroup_name   $sname
+        alias            $sname
+        members          $hmembers
+} " if $hmembers ne "";
+print "
+# SEV1 Service list
+define servicegroup{
+    servicegroup_name   $sname
+    alias	$sname
+    members	$smembers
+}" if $smembers ne "";
+}
+
+exit 0;
