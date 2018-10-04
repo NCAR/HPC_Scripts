@@ -1,0 +1,10 @@
+#!/bin/bash
+[ -z "$1" ] && echo "$0 {WHY}
+Rippersnapper will chomp down on PBS and stop any future jobs from running!
+" && exit 1
+exec 1> >(logger -s -t $(basename $0)) 2>&1
+
+WHY="$(echo "$1" | tr -d '\200-\377' | sed -e "s/'//g" -e 's/"//g' |  cut --bytes=-100)"
+echo "chomping down on pbs: $WHY"
+echo "$WHY" > /etc/THIS_IS_A_BAD_NODE.ncar
+

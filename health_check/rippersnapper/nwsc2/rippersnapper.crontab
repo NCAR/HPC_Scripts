@@ -1,0 +1,1 @@
+*/10 * * * * root test ! -f /etc/nolocal && /usr/sbin/rippersnapper enforce | logger -t rippersnapper

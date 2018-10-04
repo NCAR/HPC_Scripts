@@ -1,0 +1,364 @@
+#!/bin/bash
+ENFORCE=
+VERBOSE=
+FAILED=$(mktemp)
+export LC_ALL=C
+
+function chomp()
+{
+
+    #Chomp down on compute nodes only since this is a health check on other nodes
+    if [ $ENFORCE ]
+    then 
+	exec 1>/dev/stdout 2>/dev/stderr 
+	exec /usr/sbin/rippersnapper_chomp "$1" 
+    else
+	echo "Error Detected: $1"
+	echo "$1" >> "$FAILED"
+    fi
+}
+
+#chk_file {file path} {contents} {error message}
+#checks file contents are as given or chomps with error
+function chk_file()
+{
+    [ ! -f "$1" ] && chomp "unable to find: $1"
+    cnt="$(cat "$1" )"
+    [ "$cnt" != "$2" ] && chomp "$3: $cnt"
+}
+
+#chk_file_min {file path} {min} {error message}
+#checks file contents are minimally as given or chomps with error
+function chk_file_min()
+{
+    [ ! -f "$1" ] && chomp "unable to find: $1"
+    cnt="$(cat "$1" )"
+    [ "$cnt" -lt "$2" ] && chomp "$3: $cnt"
+}
+ 
+
+function parse_dmesg()
+{
+    grep \
+	-e xpmem_thread_group_destroy \
+	-e 'unexpected unmap of XPMEM segment' \
+	-e 'INFO: NMI handler (ghes_notify_nmi) took too long to run:' \
+	-e 'Out of memory: Kill process' \
+	-e 'CMCI storm detected' \
+	-e 'Subsequent perf sampling commands (record) will fail unless frequency' \
+	-e 'invoked oom-killer:' \
+	| while read line
+    do
+	logger -t rippersnapper "Detected dmesg error: $line"
+	chomp "Detected dmesg error: ${line}" 
+    done                 
+}
+
+function find_zombie()
+{
+    found="$(awk '
+	BEGIN {z=0; ppid=""; pid=""; uid=""; found=0} 
+	/zombie/ {
+	    z=1
+	} 
+ 	/^Pid:/ {
+	    pid=$2
+	} 
+  	/^Uid:/ {
+	    uid=$2
+
+	    if(found) {
+		print "Pid " pid " Uid " uid " Zombie Found";
+	        exit 16 
+            }
+
+	    z=0
+	    pid=""
+	    uid=""
+	    ppid=""
+	}
+	/^PPid:/ {
+	    if(z && $2 == 1) {
+		found=1
+	    }
+	    ppid=$2
+	}
+	END { 
+	    if(found) exit 16 
+	    else exit 0
+	}
+    ' /proc/*/status 2>/dev/null )"
+    [ $? -eq 16 ] && chomp "$(echo "$found" | head -1)"
+}
+
+function check_memory()
+{
+    MEMTOTAL="$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo)"
+    [ "{MEM_EXPECTED}" -gt "$MEMTOTAL" ] && chomp "memory missing: $MEMTOTAL / {MEM_EXPECTED}"
+
+    MEMBAD="$(awk '/HardwareCorrupted/ {print $2}' /proc/meminfo)"
+    [ "$MEMBAD" -gt 0 ] && chomp "Hardware corrupted memory detected: $MEMBAD kB"
+
+    #detect if any of the tmpfs filesystems are full since they break pbs
+    df |awk '/^tmpfs/ {gsub("%",""); if($5 > 98) exit 1}' || chomp "tmpfs filesystem full"
+
+    check="$(/usr/bin/timeout 60 /usr/sbin/memlogd -s 2>&1)"
+    [ $? -ne 0 ] && chomp "memlogd -s failed: $check"
+
+    check="$(/usr/bin/timeout 60 /usr/sbin/memlogd -c 2>&1)"
+    [ $? -ne 0 ] && chomp "memlogd -c failed: $check"
+
+    if [ {IS_COMPUTE} ]
+    then
+	systemctl status var-log-memlog.mount 2>&1 >/dev/null
+	[ $? -ne 0 ] && chomp "memlog mount failed"
+    fi
+
+    systemctl status memlog.service 2>&1 >/dev/null
+    [ $? -ne 0 ] && chomp "memlog service failed"
+
+    #Poll systemd since it memory resident otherwise we would hammer NFS
+    journalctl -o short | \
+	grep -i memlog | \
+	grep -v -E 'pam_thundercracker|var-log-memlog.mount|cron_memlogd|rippersnapper|ERROR memlogd is running' | \
+	parse_memlogd
+
+    #Poll systemd for thundercracker activations (TODO: avoid duplicate grep)
+    [ {IS_COMPUTE} ] && journalctl -o short | grep -G thundercracker | grep -G killing >/dev/null && chomp "thundercracker activated"
+}
+
+function parse_memlogd()
+{
+    grep -iE 'abort|UCE|fail|error|critical|integrity|flood|unable|corrupt|uncorrected|warning|prochot|assert|alarm|unsupported|overflow|invalid|persistent|compliant|disabled' | awk '
+	BEGIN {
+	    ign = 0
+	}
+	{
+	    if($0 ~ /LLC_TAG_CORR_ERR|LLC_STATE_CORR_ERR|LLC_TWOLM_CORR_ERR|LLC_CV_CORR_ERR|LLC_CORRECTABLE_DATA_ERROR|transient|Patrol Scrub/)
+	    {
+		ign += 1
+
+		if(ign == 50)
+		{
+		    print "Memlogd transient error flood detected"
+		    exit 1
+		}
+	    }
+	    else {
+		print $0
+	    }
+	}
+    ' | while read line
+    do
+	logger -t rippersnapper "Detected memlogd error: $line"
+	chomp "Detected memlogd error: ${line}" 
+    done                 
+}
+
+function check_cpu()
+{
+    for i in {0..71}
+    do
+	p="/sys/devices/system/cpu/cpu$i/"
+	[ $i -ne 0 ]  && chk_file $p/online "1" "CPU $i offline"
+	chk_file $p/microcode/version "{CPU_MICROCODE}" "incorrect CPU $i microcode version"
+	chk_file $p/thermal_throttle/core_throttle_count "0" "CPU $i core throttling"
+	chk_file $p/thermal_throttle/package_throttle_count "0" "CPU $i package throttling"
+	chk_file $p/cpufreq/scaling_driver "acpi-cpufreq" "CPU $i driver incorrect"
+	#TODO put cpu speed into pbs startup
+	#chk_file $p/cpufreq/scaling_governor "performance" "CPU $i governor incorrect"
+	chk_file_min $p/cpufreq/scaling_cur_freq 1100009 "CPU $i frequency"
+	chk_file_min $p/cpufreq/scaling_max_freq 1100009 "CPU $i max frequency"
+	chk_file_min $p/cpufreq/scaling_min_freq 1100009 "CPU $i min frequency"
+    done
+}
+
+function check_hca()
+{
+    [ -z "{HCAS}" ] && return 
+
+    p="/sys/class/infiniband/mlx5_0/ports/1"
+    chk_file $p/rate "100 Gb/sec (4X EDR)" "invalid IB speed"
+    chk_file $p/link_layer "InfiniBand" "invalid IB link_layer"
+    chk_file $p/phys_state "5: LinkUp" "invalid IB physical state"
+    chk_file $p/state "4: ACTIVE" "invalid IB state"
+    chk_file /sys/class/infiniband/mlx5_0/fw_ver "{IB_FW}" "invalid IB firmware"
+
+    echo "{HCAS}," | while read -d , dev
+    do
+	chk_file /sys/class/net/$dev/mode "datagram" "invalid IPoIB mode"
+	chk_file /sys/class/net/$dev/mtu "4092" "invalid IB mtu"
+	chk_file /proc/sys/net/ipv4/neigh/$dev/mcast_solicit "3" "invalid IB multicast solicit"
+    done
+
+    chk_file /sys/module/ib_ipoib/parameters/send_queue_size "2048" "invalid IB send_queue_size"
+    chk_file /sys/module/ib_ipoib/parameters/recv_queue_size "2048" "invalid IB recv_queue_size"
+
+    pcistate="$(/sbin/lspci -d 15b3: -vv | grep 'LnkSta:')"
+    echo "$pcistate" | grep -b 'Speed 8GT/s, Width x16, TrErr- Train- SlotClk+ DLActive- BWMgmt- ABWMgmt-' >/dev/null
+    [ $? -ne 0 ] && chomp "invalid HCA pci state: $pcistate"
+}
+
+function check_eth_bond()
+{
+    p="$1"
+    chk_file $p/xmit_hash_policy "{BOND_HASH_POLICY}" "bond not in layer3+4 mode"
+    chk_file $p/mode "802.3ad 4" "bond not in 802.3ad mode"
+    chk_file $p/lacp_rate "fast 1" "bond not in lacp mode"
+    chk_file $p/mii_status "up" "bond is down"
+}
+
+function check_gpfs()
+{
+    [ ! -S /var/mmfs/mmpmon/mmpmonSocket ] && chomp "GPFS not running"
+
+    /usr/sbin/check_gpfsmond.ncar 1 2>/dev/null >/dev/null || chomp "gpfsmond has marked this node as unhealthy"
+
+    #Disable version check for gpfs 5 upgrade
+    #VER="$(/usr/lpp/mmfs/bin/mmfsadm dump version | awk -F \" '/^Build branch/ {print $2}' | sed 's# ##g' )"
+    #[ "$VER" != "{GPFS_VERSION}" ] && chomp "wrong GPFS installed: $VER instead of {GPFS_VERSION}"
+    #
+    #STATUS="$(/usr/lpp/mmfs/bin/mmfsadm test verbs status | awk -F ": " '{print $2}')"
+    #[ "$STATUS" != "started" ] && chomp "GPFS Verbs invalid status: $STATUS"
+}
+
+function check_pbs()
+{
+    if [ ! -d /var/spool/pbs/spool/ ]
+    then
+	chomp "PBS spool directory missing"
+    fi
+
+    systemctl status array.service 2>&1 >/dev/null || chomp "arrayd is dead"
+    systemctl status ntpd.service 2>&1 >/dev/null || chomp "ntpd is dead" 
+}
+ 
+function check_firmware()
+{
+    #DMI decode is failing randomly
+    #only check bios in test mode since dmidecode should not be run from cron job
+    [ $ENFORCE ] || if [ ! -z "{BIOS_A_VERSION}" -a ! -z "{BIOS_B_VERSION}" ]
+    then
+	BIOS="$(dmidecode -t bios | awk '/Version:/ {print $2}')"
+	[ ! -z "$BIOS" -a "$BIOS" != "{BIOS_A_VERSION}" -a "$BIOS" != "{BIOS_B_VERSION}" ] && chomp "invalid BIOS version: $BIOS"
+    fi
+}             
+
+function check_image()
+{
+    [ -f /etc/nolocal ] && chomp "/etc/nolocal exists"
+    [ -f /etc/nologin ] && chomp "/etc/nologin exists"
+
+    [ "$(uname -r)" != "{KERNEL_VERSION}" ] && chomp "invalid kernel version: $(uname -r) "
+
+    if [ {IS_COMPUTE} ]
+    then
+	tr -t '\n' '' < /proc/cmdline | awk -vRS=" " -F"=" '
+	    BEGIN {
+		c["console"] = "ttyS1,115200"
+		c["IMAGE"] = "{IMAGE_NAME}"
+		c["crashkernel"] = "256M"
+		c["rcutree.rcu_cpu_stall_suppress"] = "1"
+		c["intel_idle.max_cstate"] = "1"
+		c["apparmor"] = "0"
+		c["nosmap"] = ""
+		c["intel_pstate"] = "disable"
+		c["processor.max_cstate"] = "1"
+		c["numa_balancing"] = "disable"
+	    }
+	    {
+		gsub(/\n/, "")
+		if($1 in c) {
+		    if( c[$1] != "" && $2 != c[$1] ){
+			printf "invalid /proc/cmdline %s should be %s\n", $0, c[$1]
+		    }
+		    delete c[$1]
+		}
+	    }
+	    END {
+		if(length(c) > 0)
+		    for(i in c) {
+			if(c[i] == "") print "missing /proc/cmdline " i
+			else print "missing /proc/cmdline " i "=" c[i]
+		    }
+	    }
+	' | while read line
+	do 
+	    [ ! -z "$line" ] && chomp "$line"
+	done
+    fi
+
+    OFED="$(/usr/bin/ofed_info -s)"
+    [ "$OFED" != "{OFED_VERSION}" ] && chomp "invalid OFED version: $OFED instead of {OFED_VERSION}"
+
+    #Check the users have been updated in a sane amount of time
+    DAYS=3
+    for i in {CHECK_OLD_FILES}
+    do
+	if [ "$(stat -c '%Y' $i)" -lt "$(date -d "-$DAYS days" +%s)" ]
+	then
+	    chomp "$i has not been updated in past $DAYS days"
+	fi
+    done
+}
+
+if [ "$1" = "test" ]
+then
+    ENFORCE=
+elif [ "$1" = "vtest" ] 
+then
+    ENFORCE=
+    VERBOSE=1
+elif [ "$1" = "enforce" ] 
+then                 
+    ENFORCE=1
+    
+    #write timestamp of last run
+    mkdir -p /run/rippersnapper/
+    date +%s > /run/rippersnapper/lastrun
+
+    [ -f /etc/THIS_IS_A_BAD_NODE.ncar ] && echo "known bad node: $(cat /etc/THIS_IS_A_BAD_NODE.ncar)" >&2 && exit 1
+    exec 1> >(logger -s -t $(basename $0)) 2>&1
+else
+    echo "$0 [vtest|test|enforce|help]"
+    exit 1
+fi
+
+/usr/bin/timeout 60 /usr/bin/ps -ef >/dev/null || chomp "ps -ef hung for atleast 60s" 
+dmesg -k -t -P | parse_dmesg
+check_hca
+check_memory
+[ ! -z "{CHECK_BOND}" ] && check_eth_bond "{CHECK_BOND}"
+check_image
+
+if [ {IS_COMPUTE} ]
+then
+    check_firmware
+
+    #Check services iif pbs is running
+    systemctl status pbs.service 2>&1 >/dev/null
+    #Stop testing if PBS is not running as it starts GPFS on compute
+    if [ $? -ne 0 ]
+    then
+	[ -z "$ENFORCE" -a ! -z "$VERBOSE" ] && echo "PBS is not running."
+    else
+	[ -z "$ENFORCE" -a ! -z "$VERBOSE" ] && echo "PBS is running."
+	check_gpfs
+	check_pbs
+	find_zombie
+	check_cpu
+    fi
+else
+    [ {IS_GPFS} ] && check_gpfs
+fi
+
+[ -z "$ENFORCE" -a ! -z "$VERBOSE" ] && if [ -s "$FAILED" ]
+then
+    echo "Node failed health test."
+else
+    echo "Node passed health test."
+fi
+
+unlink "$FAILED" 
+
+exit 0
