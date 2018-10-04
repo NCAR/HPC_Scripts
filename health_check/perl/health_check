@@ -1,0 +1,896 @@
+#!/usr/bin/perl
+use Fcntl ':flock';
+use IPC::Run qw( run timeout );
+use Switch;
+use Env qw(@PATH);
+use vars qw/ %opt /;
+use Getopt::Std;
+use Error;
+use Config::Scoped;
+use Config::Scoped::Error;
+use File::Spec;
+use File::Basename;
+use Sys::Syslog qw(:standard :macros);
+use strict;
+use warnings;
+
+my $opt_string = 'fsvc:g:m:t:i:';
+getopts( "$opt_string", \%opt ) or die "
+health_check {-c file} {-g group} {-m mode} {-i intensity} [-t table] [-s] [-v]
+-c {config file}\tPath to Config File
+-g {local|all|group0,group1,groupn|host1,host2,hostn}\tGroup to use.
+-m {pretty|nagios|update_gold}\tCheck Mode.
+-t {table1,table2,tablen}\tSensor (table) Filter.
+-i {intensity}\tIntensity Limit. 1-100
+-f \tForce table updates (even for state groups)
+-s \tSend all messages to syslog
+-v\tVerbose Mode
+";
+
+openlog("healthscript", "pid", LOG_DAEMON) or die;
+
+#take process priority over normal processes (cron forces a nice)
+setpriority(0,0,1);
+
+die "config file not provided" unless exists $opt{c} && $opt{c} ne "";
+my $config = $opt{c}; #diag or nagios, update_gold
+die "groups not provided" unless exists $opt{g};
+my @proximity = split(',', $opt{g}); #selects the nodes to call on. if not local, it will ssh to node. comma delimited for multiple entries
+die "mode not provided" unless exists $opt{m};
+my $cmd_type = $opt{m}; #diag or nagios, update_gold
+my $table_filter_list = "";
+$table_filter_list = $opt{t} if exists $opt{t}; #diag or nagios, update_gold (may have =table name)
+die "intensity not provided" unless exists $opt{i};
+my $max_intensity = $opt{i}; #level of intensity
+my $verbose = exists $opt{v}; #verbose mode
+my $syslog = exists $opt{s}; #verbose mode
+my $force = exists $opt{f}; #force mode
+
+# void  log(string level, string logstr)
+sub olog
+{
+    my ($level, $str) = @_;
+    if($syslog)
+    {
+	syslog($level, $str);
+    }
+    else #send to stdout
+    {
+	if($level eq LOG_ERR || $level eq LOG_EMERG || $level eq LOG_ALERT || $level eq LOG_CRIT)
+	{
+	    warn $str."\n";
+	}
+	if($level eq LOG_WARNING || $level eq LOG_NOTICE)
+	{
+	    warn $str."\n";
+	}
+	if($level eq LOG_INFO || $level eq LOG_DEBUG)
+	{
+	    print STDOUT $str."\n";
+	}
+    }
+}  
+
+#verbose log
+# void  vlog(string level, string logstr)
+sub vlog 
+{
+    my ($level, $str) = @_;
+    olog($level, $str) if $verbose;
+}
+
+#log and die
+# void  dielog(string logstr)
+sub dielog 
+{
+    my ($str) = @_;
+    olog(LOG_WARNING, $str);
+    exit 1;
+}            
+
+my %table_filter = (); # table -> 1  list of all tables to be run (may be empty, which means no filter)
+my $host = ""; # name of host running this script
+my %groups = (); # name -> @members
+my %allmembers = (); # name -> 1 list of all known members for all proximity
+my %allskip = (); # name -> 1 list of members to skip in all
+my $execution_file = File::Spec->rel2abs( __FILE__ );
+my $config_file = File::Spec->rel2abs($config);
+my $runonlylocal = 1; #tells if health check will dsh out to other nodes to make msgs uniform
+
+my $cfg_warnings = { 
+    declaration  => 'on',  # or 'on'
+    digests      => 'on',
+    macro        => 'on',
+    parameter    => 'on',
+    permissions  => 'off' #fix this later, but need it off for code dev
+};
+
+my $cfg;
+if($syslog)
+{ #this is a ugly hack but the thrown object is usually empty which is useless for debugging
+    eval
+    {
+	$cfg = Config::Scoped->new( file => $config, warnings => $cfg_warnings )->parse;
+    } or do {
+	my $ex = shift;
+	my $err = "(unknown)";
+	$err = $ex->text if defined $ex;
+	dielog "Could not read config. check for syntax error. Error: $err";
+    }
+}
+else #allow exception to shoot out
+{
+    $cfg = Config::Scoped->new( file => $config, warnings => $cfg_warnings )->parse;
+}
+dielog "Could not read config: $config \n" unless ref $cfg;
+
+#trim (string) removed leading and trailing whitespace
+sub trim {
+    my($str) = shift =~ m!^\s*(.+?)\s*$!i;
+    defined $str ? return $str : return '';
+}
+trim "a" if ! 0; #fix colors in vim, fake cmd
+
+#extract out table filter entries
+if(defined $table_filter_list && $table_filter_list ne "" && lc($table_filter_list) ne "all")
+{
+    foreach(split(/,/, $table_filter_list))
+    {  
+        $table_filter{lc($_)} = 1;
+    }
+}
+
+dielog "Identify not set in Config." unless exists $cfg->{global}{identify};
+{
+     my ($in, $out, $err);
+     my @cmd = ($cfg->{global}{identify});
+     run  \@cmd, \$in, \$host, \$err, timeout( 60 ) or dielog "Unable to get machine identity. Please verifiy \'identify\' line in config. $!";
+     chomp $host; 
+     $host = trim($host);  
+}
+
+{ #parse out the groups from cfg groups
+    foreach(keys(%{$cfg->{groups}}))
+    {
+	my $group = $_;
+	$groups{$group} = [ @{$cfg->{groups}{$group}} ];
+	foreach(@{$cfg->{groups}{$group}})
+	{
+	    $allmembers{$_} = 1;
+	}
+    }
+    delete $cfg->{groups};
+}
+    
+#parse out the all_skip
+if(exists $cfg->{global}{all_skip})
+{
+    foreach(@{$cfg->{global}{all_skip}})
+    {
+	my $name = $_;
+	if(exists $groups{$name})
+	{
+	    foreach(@{$groups{$name}})
+	    {
+		$allskip{$_} = 1;
+	    }
+	}
+	else #just a host name
+	{
+	    $allskip{$name} = 1;
+	}
+    }                      
+}
+
+dielog "global (golden) states not set" unless exists $cfg->{global}{states};
+
+#check if this node is in a state group override
+if(exists $cfg->{global}{state_groups}[0])
+{
+    foreach my $group (@{$cfg->{global}{state_groups}})
+    {
+	next unless isHostSelected([ $group ], $host); 
+	$cfg->{global}{states} =~ s/\%h/$group/g;
+
+	#lock out the update_gold command for group states
+	$cfg->{global}{states_lock} = 1;
+    }
+}
+
+#replace %h in states if it exists
+$cfg->{global}{states} =~ s/\%h/$host/g;
+ 
+dielog "global sensordirectory not set" unless exists $cfg->{global}{sensordirectory};
+dielog "global remotecmd not set" unless exists $cfg->{global}{remotecmd};
+dielog "global lock not set" unless exists $cfg->{global}{lock};
+
+#open the lock!
+dielog "invalid lock file" if $cfg->{global}{lock} eq "";
+open(LOCK, '>>', $cfg->{global}{lock} ) or dielog "Unable to open lockfile. $!";
+{
+    my $waits = 0;
+    while(!flock(LOCK, LOCK_EX | LOCK_NB))
+    {
+	if($waits > 120)
+	{
+	     dielog "Waited too long for other health_check to finish running";
+	}
+
+	++$waits;
+	olog(LOG_DEBUG, "Waiting for lock") if $waits % 5 == 0;
+	sleep 1;
+    }
+}
+
+# array getNagiosHost(string host, string type)
+sub getNagiosHost
+{
+    my ($host, $type) = @_;
+    my @srvs = ();
+
+    #walk the array and match against the regexs
+    foreach my $srv (keys(%{$cfg->{nagios}{ncsa}{$type}}))
+    {
+	my $hostpfilter = "";
+	my $hostnfilter = "";
+	$hostpfilter = $cfg->{nagios}{ncsa}{$type}{$srv}{host_regex} if exists $cfg->{nagios}{ncsa}{$type}{$srv}{host_regex};
+	$hostnfilter = $cfg->{nagios}{ncsa}{$type}{$srv}{not_host_regex} if exists $cfg->{nagios}{ncsa}{$type}{$srv}{not_host_regex}; 
+
+	push @srvs, $srv if $hostpfilter eq "" && $hostnfilter eq "";
+	push @srvs, $srv if $hostpfilter ne "" && $host =~ m/$hostpfilter/;
+	push @srvs, $srv if $hostnfilter ne "" && $host !~ m/$hostnfilter/;
+    }
+
+    return @srvs;
+}
+
+# string getGangliaHost(string host)
+sub getGangliaHost
+{
+    my ($host) = @_;
+
+    #walk the array and match against the regexs
+    foreach my $srv (keys(%{$cfg->{ganglia}{gmetricl}}))
+    {
+	if($srv ne "command")
+	{
+	    my $hostpfilter = "";
+	    my $hostnfilter = "";
+	    $hostpfilter = $cfg->{ganglia}{gmetricl}{$srv}{host_regex} if exists $cfg->{ganglia}{gmetricl}{$srv}{host_regex};
+	    $hostnfilter = $cfg->{ganglia}{gmetricl}{$srv}{not_host_regex} if exists $cfg->{ganglia}{gmetricl}{$srv}{not_host_regex}; 
+
+	    return $srv if $hostnfilter eq "" && $hostpfilter eq "";
+	    return $srv if $hostpfilter ne "" && $host =~ m/$hostpfilter/;
+	    return $srv if $hostnfilter ne "" && $host !~ m/$hostnfilter/;
+	}
+    }
+
+    vlog(LOG_INFO, "No ganglia servers found: $host");
+    return "";  #nothing found!
+}
+
+# Allow metric name spoofing
+# string getGangliaHostMetric(string host)
+sub getGangliaHostMetric
+{
+    my ($host) = @_;
+
+    #walk the array and match against the regexs
+    foreach my $srv (keys(%{$cfg->{ganglia}{spoof}}))
+    {
+	if($srv eq $host)
+	{
+	    return ($cfg->{ganglia}{spoof}{$host}{host}, $cfg->{ganglia}{spoof}{$host}{ip});
+	}
+    }
+
+    return ("$host", "");  #nothing found!
+}    
+
+# bool  isHostSelected(string grouplist, string thost)
+sub isHostSelected
+{
+    dielog "missing ops $!" unless defined $_[0] && defined $_[1];
+
+    my @filters = @{$_[0]};
+    my $thost = $_[1];
+    foreach my $filter (@filters)
+    {
+        return 1 if lc($filter) eq "all"; #all groups allowed?
+        return 1 if $filter eq $thost; #direct string match (possibly hostname or 'local')
+        return 1 if defined $groups{$filter} && grep {$_ eq $thost} @{$groups{$filter}}; #is filter a group name and is host a member of that group
+    }
+    return 0;
+}
+
+# bool  isTableSelected(string table)
+sub isTableSelected
+{
+    dielog "missing ops $!" unless defined $_[0];
+    return 1 if scalar keys(%table_filter) == 0; #no filters
+    return 1 if defined $table_filter{$_[0]};
+    return 0;
+}
+ 
+#bool cpgExclude($sensor_name, $nagios_host)
+#sensor can be ""
+sub cpgExclude
+{
+    my ($sensor, $nhost) = @_;
+
+    if(exists $cfg->{nagios} && exists $cfg->{nagios}{cpg} && exists $cfg->{nagios}{cpg}{exclude})
+    {
+	if($nhost ne "" && exists $cfg->{nagios}{cpg}{exclude}{hosts})
+	{
+	    return 1 if isHostSelected($cfg->{nagios}{cpg}{exclude}{hosts}, $nhost);
+	}
+	if($sensor ne "" && exists $cfg->{nagios}{cpg}{exclude}{sensors})
+	{
+	    return 1 if grep {$_ eq $sensor} @{$cfg->{nagios}{cpg}{exclude}{sensors}};
+	}
+    } 
+
+    return 0;
+}
+
+sub stateCheck
+{
+	my $name = $_[0];
+	my $sensor = $_[1]; 
+	my $rows_checked = $_[2];
+	my $rows = $_[3];
+	my $field_names = $_[4];
+	my $read_field_names = 0;
+
+	my $field_delimiter = ' ';
+	my $entry_delimiter = "\n";
+	
+	$field_delimiter = $sensor->{delimiter}{field} if exists $sensor->{delimiter}{field};
+	$entry_delimiter = $sensor->{delimiter}{entry} if exists $sensor->{delimiter}{entry};
+
+	{ #open table for comparison if it exists
+	    my $source_table = $cfg->{global}{states} ."/". $name;
+	    my $goldtable = '';
+	    if(open(TABLE, '<', $source_table))
+	    {
+		#read all of table at once
+		undef $/;
+		$goldtable = <TABLE>;
+		close(TABLE);     
+		foreach my $entry (split($entry_delimiter, $goldtable))
+		{
+		    my @fields = split $field_delimiter, $entry;
+		    next if $#fields < 1;
+
+		    if(!$read_field_names) #first line is always field names
+		    {
+			#check field names match
+			if(scalar @{$field_names} != scalar @fields)
+			{
+			    olog(LOG_ERR, "Sensor error $name: number of field names is different: sensor=".  scalar(@{$field_names}) ." gold=". scalar(@fields));
+			    return 0;
+			}
+			#check headers are the same
+			for(my $i = 0; $i < scalar @{$field_names}; ++$i)
+			{
+			    if($field_names->[$i] ne $fields[$i])
+			    {
+				olog(LOG_ERR, "Sensor error $name: field names are different: sensor=". $field_names->[$i] ." gold=". $fields[$i]);
+				return 0;
+			    }
+			}
+
+			$read_field_names = 1;
+		    }
+		    else #normal line
+		    {
+			my $key = $fields[0];
+			next if $key eq "";
+			#dielog "$row_name $key already exists" if defined $rows->{$key} && $verbose > 3;
+			$rows_checked->{$key}{checked} = "1";
+
+			if(!exists $rows->{$key})
+			{
+			    #row should exist
+			    $rows_checked->{$key}{msg} = "Missing Entry.";
+			    $rows_checked->{$key}{status} = "error";
+			    next;
+			}
+
+			if(scalar @{$rows->{$key}} != scalar @fields)
+			{
+			    $rows_checked->{$key}{msg} = "Number of fields is different: sensor=".  scalar(@{$rows->{$key}}) ." gold=". scalar(@fields).".";
+			    $rows_checked->{$key}{status} = "error";
+			    next; 
+			}
+
+			if(exists $rows_checked->{$key}{status})
+			{
+			    $rows_checked->{$key}{msg} = "Duplicate entry.";
+			    $rows_checked->{$key}{status} = "error";
+			    next;  
+			}
+
+			$rows_checked->{$key}{status} = "ok";
+
+			# check each field
+			for(my $i = 0; $i < scalar @fields; ++$i)
+			{
+			    if(exists $sensor->{stats} && exists $sensor->{stats}{$field_names->[$i]})
+			    {
+				#stat
+			    }
+			    if(exists $sensor->{comment} && $sensor->{comment} eq $field_names->[$i])
+			    {
+				#comment field
+				$rows_checked->{$key}{comment} = $rows->{$key}[$i];
+			    }
+			    else #not a stat
+			    {
+				if($fields[$i] ne $rows->{$key}[$i])
+				{
+				    $rows_checked->{$key}{msg} .= " " if exists $rows_checked->{$key}{msg};
+				    $rows_checked->{$key}{msg} = "Field ".$field_names->[$i]." is \"".$rows->{$key}[$i]."\" but should be \"".$fields[$i]."\".";
+				    $rows_checked->{$key}{status} = "error";
+				}
+			    }
+			}                   
+		    }
+	       }
+	    }
+	}
+
+	#return 0 unless $read_field_names;
+
+	#find new rows
+	foreach my $key (keys(%{$rows}))
+	{
+	    if(!$rows_checked->{$key}{checked})
+	    {
+		$rows_checked->{$key}{checked} = 1;
+		$rows_checked->{$key}{msg} = "Unexpected entry.";
+		$rows_checked->{$key}{status} = "error";
+	    }
+	} 
+
+	return 1;
+}
+
+
+sub runSensor
+{
+ 	my $name = $_[0];
+	vlog(LOG_INFO, "Run Sensor: $name");
+	my $sensor = $_[1];
+  	my $rows_checked = $_[2];
+  	my $rows = $_[3];
+	my $field_names = $_[4];
+
+        {#run sensor and parse output
+	    my ($out, $err, $in) = "";    
+	    my @cmd = ($cfg->{global}{sensordirectory} ."/". $sensor->{script});
+	    if(!(run \@cmd, \$in, \$out, \$err, timeout( 60 + 15 * $sensor->{intensity} )) || $? != 0 || $err ne "" || $out eq "")
+	    {
+		olog(LOG_ERR, "Sensor error $name: $err $out");
+		return 0;
+	    }            
+
+	    my $field_delimiter = ' ';
+	    my $entry_delimiter = "\n";
+
+	    $field_delimiter = $sensor->{delimiter}{field} if exists $sensor->{delimiter}{field};
+	    $entry_delimiter = $sensor->{delimiter}{entry} if exists $sensor->{delimiter}{entry};
+
+	    foreach my $entry (split($entry_delimiter, $out))
+	    {
+		my @fields = split $field_delimiter, $entry;
+
+		next if $#fields < 1;
+
+		if(scalar @{$field_names} == 0)
+		{
+		    @{$field_names} = @fields;
+		}
+		else #normal entry
+		{
+		    my $key = $fields[0];
+		    next if $key eq "";
+		    #dielog "$row_name $key already exists" if defined $rows{$key} && $verbose > 3;
+
+		    $rows->{$key} = [ @fields ]; 
+		    $rows_checked->{$key}{checked} = 0;
+		} 
+	    }
+	}                   
+
+	return 1;
+}
+ 
+sub runSensors
+{
+    my %nagios = (); # {cpg|ssg}{srv} => "nagios update"
+    my %gmetric = (); # srv => "gmetric update"
+             
+    my $ran_sensors = 0;
+    foreach(keys(%{$cfg->{sensors}}))
+    {
+	my $name = $_;
+	my %sensor = %{$cfg->{sensors}{$name}};
+
+	next if $sensor{type} eq "dummy"; #ignore dummy services, they exist for nagios service generation only
+	next if $sensor{type} eq "nagios"; #ignore nagios direct services, they exist for nagios service generation only
+
+	dielog "Sensor $name missing script field" unless exists $sensor{script};
+	dielog "Sensor $name missing source field" unless exists $sensor{source};
+	dielog "Sensor $name missing type field" unless exists $sensor{type};
+	dielog "Sensor $name missing intensity field" unless exists $sensor{intensity};
+
+	#filter sensors according to user input and config
+	my @filter = @{$sensor{source}};
+        next unless isHostSelected(\@filter, $host);
+        next unless isTableSelected($name);
+	next if $sensor{intensity} > $max_intensity;
+
+	#skip sensor in nagios mode unless it has stats or nagios output
+	if($cmd_type eq "nagios" && ! exists $sensor{stats})
+	{
+	    next unless exists $sensor{nagios};
+	    next unless exists $sensor{nagios}{hosts};
+	    next if $sensor{nagios}{hosts}[0] eq "-";
+	}
+
+	my %rows = ();
+  	my %rows_checked = ();
+	my @field_names = ();
+	next unless runSensor($name, \%sensor, \%rows_checked, \%rows, \@field_names);
+	next unless stateCheck($name, \%sensor, \%rows_checked, \%rows, \@field_names);
+
+	if($cmd_type eq "pretty")
+	{
+	    foreach my $key (keys(%rows_checked))
+	    {
+		if(exists $rows_checked{$key}{msg})
+		{
+		    my $what = "Error:";
+		    $what = "Warning:" if $rows_checked{$key}{status} eq "warn";
+		    $what = "Error:" if $rows_checked{$key}{status} eq "error";
+
+		    my $str = "Sensor: $name Entry: $key $what $rows_checked{$key}{msg}";
+		    $str = "$host: " . $str if !$runonlylocal;
+		    olog(LOG_INFO, $str);
+		}
+	    }
+	}
+	elsif($cmd_type eq "update_gold")
+	{
+	    my $changes = 0;
+            foreach my $key (keys(%rows_checked))
+	    {
+		++$changes if $rows_checked{$key}{status} ne "ok";
+	    }
+            
+	    if(!$force && exists $cfg->{global}{states_lock} && $cfg->{global}{states_lock})
+	    {
+		my $str = "Refusing to updated $name due update gold lock being active. \tRows Changed: $changes";
+		$str = "$host: " . $str if !$runonlylocal; 
+		olog(LOG_ERR, $str);
+	    }
+	    else #not locked out for updates
+	    {
+		#check if gold directory exists, if not try to make it
+		if(! -d $cfg->{global}{states})
+		{
+		    mkdir($cfg->{global}{states}, 0755) or dielog "unable to make directory ".$cfg->{global}{states};
+		}
+
+		my $field_delimiter = ' ';
+		my $entry_delimiter = "\n";
+
+		$field_delimiter = $sensor{delimiter}{field} if exists $sensor{delimiter}{field};
+		$entry_delimiter = $sensor{delimiter}{entry} if exists $sensor{delimiter}{entry};
+
+		#overwrite gold table
+		open(TABLE, '>', $cfg->{global}{states} ."/". $name) or dielog $!;
+		print TABLE join($field_delimiter, @field_names) .$entry_delimiter;
+		foreach my $key (keys(%rows))
+		{
+		    print TABLE join($field_delimiter, @{$rows{$key}}) .$entry_delimiter;
+		}
+		close(TABLE);      
+
+		my $str = "Updated $name. \tRows Changed: $changes";
+		$str = "$host: " . $str if !$runonlylocal;
+		olog(LOG_INFO, $str); 
+	    }
+	}
+        elsif($cmd_type eq "nagios") #also sets up gmetrics
+	{
+	    my $sname = $name;
+		if(exists $sensor{nagios})
+		{
+		    $sname = $sensor{nagios}{name} if exists $sensor{nagios}{name} && $sensor{nagios}{name} ne "-";
+		    $sname = $cfg->{nagios}{cluster}{short} ."_". $sname if exists $cfg->{nagios}{cluster}{short};
+		    $sname = $sensor{nagios}{absolute_name} if exists $sensor{nagios}{absolute_name} && $sensor{nagios}{absolute_name} ne "-";
+		    my $update_count = 0; 
+
+		    if($sensor{type} eq "service" || $sensor{type} eq "host")
+		    {
+			foreach my $key (keys(%rows_checked))
+			{
+			    #host state 0=UP, 1=DOWN, 2=UNREACHABLE
+			    #src state 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
+			    my $state = 1;
+			    my $pretty = $rows_checked{$key}{status};
+			    $pretty = $rows_checked{$key}{msg} if exists $rows_checked{$key}{msg};
+			    my $update;
+			    my $nhost;
+			    my $comment = $pretty; #default nagios comment is the pretty comment
+			    $comment = $rows_checked{$key}{comment} if exists $rows_checked{$key}{comment};
+
+			    if($sensor{type} eq "service")
+			    {
+				$state = 0 if $rows_checked{$key}{status} eq "ok"; 
+				$state = 1 if $rows_checked{$key}{status} eq "warn"; 
+				$state = 2 if $rows_checked{$key}{status} eq "error"; 
+				$state = 1 if exists $cfg->{global}{nagios_force_warn_only} && $cfg->{global}{nagios_force_warn_only} eq 'true' && ($rows_checked{$key}{status} eq "error" || $rows_checked{$key}{status} eq "warn"); 
+				$nhost = $key;
+
+				$update = "$nhost;$sname;$state;$comment\n";   
+			    }
+			    else #elsif($sensor{type} eq "host")
+			    {
+				$state = 0 if $rows_checked{$key}{status} eq "ok"; 
+				$state = 1 if $rows_checked{$key}{status} ne "ok";
+				$state = 2 if exists $cfg->{global}{nagios_force_warn_only} && $cfg->{global}{nagios_force_warn_only} eq 'true' && $rows_checked{$key}{status} ne "ok"; 
+				$nhost = $key;
+
+				$update = "$nhost;$state;$comment\n";   
+			    }
+
+			    next unless isHostSelected($sensor{nagios}{hosts}, $nhost);
+			    ++$update_count;
+
+			    foreach my $srv (getNagiosHost($nhost,'ssg'))
+			    {
+				$nagios{ssg}{$srv} .= $update;
+			    }
+			    unless(cpgExclude($name, $nhost))
+			    {
+				foreach my $srv (getNagiosHost($nhost,'cpg'))
+				{
+				    $nagios{cpg}{$srv} .= $update;
+				}
+			    }
+			}
+		    }
+		    elsif($sensor{type} eq "aggregate")
+		    {
+			 my $state = 0;
+			 my $pretty = "";
+			 my $comment = "";
+			 my $update;
+
+			 #combine all errors and comments
+			 foreach my $key (keys(%rows_checked))
+			 {
+				$comment .= $rows_checked{$key}{comment} if exists $rows_checked{$key}{comment};
+				$state = 1 if $state == 0 && $rows_checked{$key}{status} eq "warn"; 
+				$state = 2 if $rows_checked{$key}{status} eq "error";  
+				$state = 1 if exists $cfg->{global}{nagios_force_warn_only} && $cfg->{global}{nagios_force_warn_only} eq 'true' && $rows_checked{$key}{status} ne "ok"; 
+
+				if($rows_checked{$key}{status} ne "ok")
+				{
+					$pretty .= " " if $pretty ne "";
+					$pretty .= "$key: ". $rows_checked{$key}{msg};
+				}
+			 }
+
+			 $pretty = "ok" if $pretty eq "";
+			 $comment = $pretty if $comment eq "";
+			 $update = "$host;$sname;$state;$pretty\n";   
+			 ++$update_count;
+
+			 foreach my $srv (getNagiosHost($host,'ssg'))
+			 {
+			     $nagios{ssg}{$srv} .= $update;
+			 }
+			 unless(cpgExclude($name, $host))
+			 {
+			     foreach my $srv (getNagiosHost($host,'cpg'))
+			     {
+			 	$nagios{cpg}{$srv} .= $update;
+			     }
+			 }
+		    }
+		    vlog(LOG_INFO, "sensor: $sname updates: $update_count");
+		}
+
+	    #gmetrics
+	    foreach my $key (keys(%rows))
+	    {    
+		for(my $i = 0; $i < scalar @field_names; ++$i)
+		{
+		    if(exists $sensor{stats}{$field_names[$i]})
+		    {
+			my $stat = \$sensor{stats}{$field_names[$i]};
+			my ($ghost, $group, $description, $title, $gname, $value, $type, $units, $slope, $tmax, $dmax) = ("", "", "", "", "", "", "", "", "", "", "");
+			$title = "";
+			if($sensor{type} eq "aggregate")
+			{
+			    $ghost = $host;
+			    $gname = $name .".". $key .".". $field_names[$i]; 
+			    $title = $key .": ". $$stat->{title} if exists $$stat->{title};
+			}
+			else #src or host
+			{
+ 			    $ghost = $key;
+			    $gname = $name .".". $field_names[$i];  
+			    $title = $$stat->{title} if exists $$stat->{title};
+			}
+			if(exists $cfg->{ganglia}{override_suffix})
+			{
+			    $ghost =~ s/en$/ge/;
+			}
+			$group = $$stat->{group} if exists $$stat->{group};
+			vlog(LOG_WARNING , "Gmetric value for $gname is non-existant") unless exists $rows{$key}[$i];
+			$value = $rows{$key}[$i] if exists $rows{$key}[$i]; 
+			$description = $$stat->{description} if exists $$stat->{description};
+			$type = $$stat->{type} if exists $$stat->{type};
+			$units = $$stat->{units} if exists $$stat->{units};
+			$slope = $$stat->{slope} if exists $$stat->{slope};
+			$tmax = $$stat->{tmax} if exists $$stat->{tmax};
+			$dmax = $$stat->{dmax} if exists $$stat->{dmax};
+
+			#fix quotes
+			$ghost =~ s/"/\\"/;
+			$group =~ s/"/\\"/;
+			$description =~ s/"/\\"/;
+			$title =~ s/"/\\"/;
+			$gname =~ s/"/\\"/;
+			$value =~ s/"/\\"/ if $value ne "";
+			$type =~ s/"/\\"/;
+			$units =~ s/"/\\"/;
+			$slope =~ s/"/\\"/;
+			$tmax =~ s/"/\\"/;
+			$dmax =~ s/"/\\"/;
+
+			if($value ne "-")
+			{
+			    my $greshost = getGangliaHost($host);
+			    my ($spoofhost, $spoofip) = getGangliaHostMetric($ghost);
+			    $gmetric{$greshost} .= "\n" if exists $gmetric{$greshost};
+			    $gmetric{$greshost} .= "\"$spoofhost\",$spoofip, \"$group\", \"$description\", \"$title\", \"$gname\", \"$value\", \"$type\", \"$units\", \"$slope\", \"$tmax\", \"$dmax\"";
+			}
+		    }
+		}
+	    }
+             
+	}
+
+	++$ran_sensors
+    }
+
+    #send updates to nagios
+    if($cmd_type eq "nagios")
+    {
+	vlog(LOG_INFO, "start sending NSCA updates");
+	#walk the array and match against the regexs
+	foreach my $type ('ssg', 'cpg')
+	{
+	    foreach my $srv (keys(%{$cfg->{nagios}{ncsa}{$type}}))
+	    {
+		if(exists($nagios{$type}{$srv}))
+		{
+		    if(exists $cfg->{nagios}{ncsa}{$type}{$srv}{command})
+		    {
+			my $update = $nagios{$type}{$srv};
+			vlog(LOG_INFO, "Send NSCA type: $type server: $srv Updates: ". scalar($update =~ tr/\n//));
+
+			my ($out, $err);
+			my @cmd = ();
+			@cmd = split(" ", $cfg->{nagios}{ncsa}{$type}{$srv}{command});
+			if(!(run  \@cmd, \$update, \$out, \$err, timeout(60)) || $? != 0 || $err ne "" || $out eq "")
+			{
+			    olog(LOG_ERR, "Error while sending nsca type:$type server:$srv return: $? error: $err out: $out");
+			}
+		    }
+		    else #no command specified 
+		    {
+			olog(LOG_WARNING, "nsca type:$type server:$srv does not have a command specified");
+		    }
+		}
+	    }
+	}
+	vlog(LOG_INFO, "end sending NSCA updates");
+     
+	vlog(LOG_INFO, "start sending gmetric updates");
+	foreach my $srv (keys(%{$cfg->{ganglia}{gmetricl}}))
+	{
+	    if($srv eq "command")
+	    {
+		$srv = "";
+	    }
+
+	    if(exists($gmetric{$srv}))
+	    {
+		if(exists $cfg->{ganglia}{gmetricl}{$srv}{command} || ($srv eq "" && exists $cfg->{ganglia}{gmetricl}{command}))
+		{ 
+		    my $update = $gmetric{$srv};
+		    #vlog(LOG_INFO, "Send gmetricl server: $srv Updates: \n".$update);
+		    vlog(LOG_INFO, "Send gmetricl server: $srv Updates: ". scalar($update =~ tr/\n//));
+
+		    my ($out, $err);
+		    my @cmd = ();
+		    @cmd = split(" ", $cfg->{ganglia}{gmetricl}{command}) if $srv eq "";
+		    @cmd = split(" ", $cfg->{ganglia}{gmetricl}{$srv}{command}) if $srv ne ""; 
+		    push @cmd, "-d3" if $verbose; #gmetricl is not very chatty, give it some encouragement
+		    vlog(LOG_INFO, "gmetricl cmd: ".join(' ', @cmd));
+		    vlog(LOG_INFO, "gmetricl update: $update");
+		    if(!(run  \@cmd, \$update, \$out, \$err, timeout(60)) || $? != 0)
+		    {
+			olog(LOG_ERR, "Error while sending gmetricl server:$srv return: $? error: $err out: $out");
+		    }        
+                    if($verbose && ($err ne "" || $out ne ""))
+		    {
+			chomp($err);
+			chomp($out);
+			vlog(LOG_INFO, "Gmetricl Output: server:$srv return: $? error: ".$err." out: ".$out);
+		    }         
+		}
+		else #no command specified 
+		{
+		    olog(LOG_WARNING, "gmetric server:$srv does not have a command specified");
+		}    
+	    } 
+	}        
+	vlog(LOG_INFO, "end sending gmetric updates");
+    }
+
+    return $ran_sensors;
+}
+
+#check if sensors should be run for local
+{
+    #cd to sensor directory
+    chdir $cfg->{global}{sensordirectory} or dielog "unable to cd to sensor directory";
+
+    my $runlocal = isHostSelected(\@proximity, "local") || isHostSelected(\@proximity, $host);
+    my $hostlist = "";        
+    foreach(keys(%allmembers))
+    {
+	$hostlist .= "$_," if isHostSelected(\@proximity, $_) && $_ ne $host && ! exists $allskip{$_};
+    } 
+    $runonlylocal = length $hostlist == 0;
+
+    if($runlocal)
+    {
+	my $ran = runSensors;
+	if(!$ran)
+	{
+	    my $str = "Warning: No sensors were run.";
+	    $str = "$host: $str" if !$runonlylocal; 
+	    olog(LOG_INFO, $str);
+	}
+    }
+
+    if(!$runonlylocal)
+    {
+	#my $cmd_type_filter = defined $table_filter_list ? $cmd_type."=".$table_filter_list : $cmd_type;
+	my @cmd = split(' ', $cfg->{global}{remotecmd});
+	my $tables = "";
+	$tables = " -t $table_filter_list " if $table_filter_list ne "";
+	my $vtxt = "";
+	$vtxt = "-v" if $verbose;
+	my $ftxt = "";
+	$ftxt = "-f" if $force;
+	push @cmd, $hostlist, "$execution_file -c $config_file  -g local -m $cmd_type -i $max_intensity $tables $vtxt $ftxt";
+	exec @cmd or dielog "failed to exec remote command " .join(' ', @cmd);
+    }
+    else #host list empty
+    {
+	dielog "Error: no hosts selected." unless $runlocal;
+    }
+}
+
+close(LOCK); #releases lock
+exit 0;
