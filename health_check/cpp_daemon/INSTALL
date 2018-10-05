@@ -1,0 +1,10 @@
+Prereqs:
+Boost
+Json Spirit: http://www.codeproject.com/KB/recipes/JSON_Spirit.aspx
+Google Test (Test Unit Only): http://code.google.com/p/googletest/
+
+Install:
+cmake CMakeLists.txt
+make
+make test
+make doc #make documentation
