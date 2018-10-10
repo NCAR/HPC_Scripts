@@ -1,0 +1,1 @@
+*/5 * * * * lsfadmin flock -xn /var/tmp/get_slurm_stat_clusters /usr/sbin/get_slurm_stat_clusters.ncar

@@ -1,0 +1,61 @@
+#!/bin/bash
+export PATH=/usr/local/bin/:$PATH
+export LD_LIBARAY_PATH=/usr/local/lib64:/usr/local/lib:$LD_LIBARAY_PATH
+
+declare -a cmdargs
+cmdargs["nodes"]="-g slurm -t int32 -u nodes -s both --tmax=1400 --dmax=1400"
+cmdargs["state_avail"]="-g slurm -t int32 -u nodes -s both --tmax=1400 --dmax=1400"
+cmdargs["cpu_allocated"]="-g slurm -t int32 -u threads -s both --tmax=1400 --dmax=1400"
+cmdargs["cpu_idle"]="-g slurm -t int32 -u threads -s both --tmax=1400 --dmax=1400"
+cmdargs["cpu_other"]="-g slurm -t int32 -u threads -s both --tmax=1400 --dmax=1400"
+cmdargs["cpu_total"]="-g slurm -t int32 -u threads -s both --tmax=1400 --dmax=1400"
+cmdargs["resv_user"]="-g slurm -t int32 -u threads -s both --tmax=1400 --dmax=1400"
+cmdargs["resv_sys"]="-g slurm -t int32 -u threads -s both --tmax=1400 --dmax=1400"
+
+function calcstat(){
+    #geyser16 up down* 0 0 80 80
+    sinfo -hNel --nodes "$1" --format "%n %a %T %C" | uniq | sed -e 's#\/# #g' | awk '
+    BEGIN {
+	nodes=0
+	state_avail=0
+	cpu_allocated=0
+	cpu_idle=0
+	cpu_other=0
+	cpu_total=0
+	cpu_resv_user=0
+	cpu_resv_sys=0
+    }
+    {
+	nodes += 1
+
+	if($2 == "up" && ( $3 == "reserved" || $3 == "completing" || $3 == "mixed" || $3 == "allocated" || $3 == "idle")) state_avail += 1
+	if($3 == "reserved" ) cpu_resv_user += 1
+	if($3 == "maint" ) cpu_resv_sys += 1
+	cpu_allocated += $4
+	cpu_idle += $5
+	cpu_other += $6
+	cpu_total += $7
+    }
+    END {
+	print "nodes", nodes
+	print "state_avail", state_avail
+	print "cpu_allocated", cpu_allocated
+	print "cpu_idle", cpu_idle
+	print "cpu_other", cpu_other
+	print "cpu_total", cpu_total
+	print "resv_user", cpu_resv_user
+	print "resv_sys", cpu_resv_sys
+	printf "%s %s %s %s %s %s %s %s ", nodes, state_avail, cpu_allocated, cpu_idle, cpu_other, cpu_total, cpu_resv_user, cpu_resv_sys
+    }
+    ' | while read sensor value
+    do
+	gmetric -n slurm_cluster_stat.${2}_${sensor} -v ${value} ${cmdargs[$sensor]}
+    done
+}
+
+calcstat "geyser[01-16]" "geyser"
+calcstat "caldera[01-16]" "caldera"
+calcstat "pronghorn[01-14]" "pronghorn"
+calcstat "gladeslurm[1-4]" "io"
+calcstat "casper[01-26]" "casper"
+
