@@ -1,0 +1,32 @@
+SHELL        = /bin/sh
+CD           = cd
+CP           = cp
+LN_S         = ln -s
+MKDIR        = mkdir
+RM           = /bin/rm -f
+TOUCH        = touch
+ARCH         = $(arch)
+TOPdir       = ../../..
+INCdir       = $(TOPdir)/include
+BINdir       = $(TOPdir)/bin/$(ARCH)
+LIBdir       = $(TOPdir)/lib/$(ARCH)
+HPLlib       = $(LIBdir)/libhpl.a
+MPdir        =
+MPinc        =
+MPlib        =
+LAdir        =
+LAinc        =
+LAlib        =
+F2CDEFS      =
+HPL_INCLUDES = -I$(INCdir) -I$(INCdir)/$(ARCH) $(LAinc) $(MPinc)
+HPL_LIBS     = $(HPLlib) $(LAlib) $(MPlib) -lm
+HPL_OPTS     = -DHPL_CALL_CBLAS
+HPL_DEFS     = $(F2CDEFS) $(HPL_OPTS) $(HPL_INCLUDES)
+CC           = mpicc -cc=icc
+CCNOOPT      = $(HPL_DEFS)
+CCFLAGS      = $(HPL_DEFS) -O3 -mavx -xhost -no-prec-div -fno-alias -fp-model fast=2 -DMPICH_SKIP_MPICXX -mkl
+LINKER       = mpicc -cc=icc
+LINKFLAGS    = $(CCFLAGS)
+ARCHIVER     = ar
+ARFLAGS      = r
+RANLIB       = echo
