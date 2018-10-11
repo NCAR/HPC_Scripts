@@ -1,0 +1,82 @@
+#!/bin/bash
+[ -z "$1" -o -z "$2" ] && echo "$0 {eth switch range for xcat} {ntp server ip}" && exit 1
+NR=$1
+ip="$2"
+[ ! -z "$3" ] && force=1
+#xdsh "$NR" -l admin --devicetype EthSwitch::BNT "show version"
+
+function con {
+	switch=$1
+	ip=$2
+	/usr/bin/expect <<-EOF
+	set force_conservative 0 ;# set to 1 to force conservative mode even if
+	;# script wasn't run conservatively originally
+	
+	if {\$force_conservative} {
+	    set send_slow {1 .1}
+	    proc send {ignore arg} {
+		sleep .1
+		exp_send -s -- \$arg 
+	    }
+	}
+	
+	set timeout 3
+	log_user 0
+	set switch [lindex \$argv 0 ]
+	spawn ssh -l admin $switch
+	
+	expect eof {
+	   exit 1
+	}
+	
+	log_user 0
+	
+	expect "assword:" {
+	    send -- "admin\\r"
+	}
+	
+	expect "*>" {
+	    send -- "terminal-length 0\\r"
+	}
+	
+	log_user 1
+ 	expect "*>" {
+	    send -- "enable\\r"
+	}
+
+  	expect "*#" {
+	    send -- "configure terminal\\r"
+	}
+ 
+ 	expect "*#" {
+	    send -- "logging host 1 address $ip\\r"
+	}
+ 
+	expect "*#" {
+	    send -- "logging log all\\r"
+	}
+
+  	expect "*#" {
+	    send -- "write memory\\r"
+	}
+
+ 	expect "*#" {
+	    send -- "exit\\r"
+	}
+ 
+	expect "*>" {
+	    log_user 0
+	    send -- "exit\\r"
+	}
+	EOF
+}
+
+if [ $force ]
+then
+    con "$NR" "$ip" 
+else
+    nodels "$NR" | while read node
+    do
+	con "$node" "$ip"
+    done
+fi

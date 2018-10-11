@@ -1,0 +1,73 @@
+#!/bin/bash
+#
+# Creates report from IMM clock states
+#
+export PATH=/opt/xcat/bin/:/ssg/bin/:$PATH
+
+hostname=$(hostname -s)
+pre=$(echo "$hostname"| awk '{print substr($1, 0, 2)}')
+NR=
+[ "$pre" = "js" ] && NR=ufm,compute,login,bb,yg,jsboot,jsmgt2 #jsmgt1 is broke
+[ "$pre" = "er" ] && NR=ufm,compute,login #ermgt[1-2] are broke
+[ "$pre" = "ys" ] && NR=ysmgt[1-3],admin,boot,login,gy,ca,pr,compute,-badnodes
+[ -z "$NR" ] && echo "unknown node" && exit 1
+
+OUT="$(mktemp)"
+
+test_imm_clock_state $NR > "$OUT"
+
+SUMMARY="$(cat "$OUT" | awk -F: '
+    BEGIN {
+	pass=0
+	fail=0
+	errors=0
+	#error=
+	#passn= #dont need to list the passed nodes
+	#failn=
+    }
+    {
+	if($2 ~ /[pP][aA][sS][sS]/) {
+	    pass += 1
+	    #passn[pass] = $1
+	}
+	else if($2 ~ /[fF][aA][iI][lL]/) {
+	    fail += 1
+	    failn[fail] = $1
+	}
+	else { #unknown errors
+	    errors += 1
+	    error[errors] = $0
+	}
+
+    }
+    END {
+	print "PASS=" pass " FAILED=" fail " ERRORS=" errors
+
+	faillist=""
+	for (n in failn) {
+	    if(faillist != ""){
+		faillist = faillist ","
+	    }
+
+	    faillist = faillist failn[n]
+	}
+
+	if(faillist != ""){
+	    print "NR_FAILED=" faillist
+	}
+
+	if(1 in error){
+	    print "ERRORS:"
+	    for (e in error)
+		print error[e]
+	}
+
+	print
+	print "Detailed report:"
+	
+    }
+')"
+
+echo "$SUMMARY" | cat - "$OUT" |grep -v ": PASS" | mail -s "$(echo "IMM Clock Report: $SUMMARY" | head -1)" ssgmon@ucar.edu 
+
+unlink "$OUT"

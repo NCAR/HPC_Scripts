@@ -1,0 +1,26 @@
+#!/bin/bash
+[ -z "$1" -o -z "$2" ] && echo "$0 {eth switch range for xcat} {tftp server ip}" && exit 1
+NR=$1
+ip="$2"
+[ ! -z "$3" ] && force=1
+#xdsh "$NR" -l admin --devicetype EthSwitch::BNT "show version"
+
+function con {
+	switch=$1
+	ip=$2
+	bkfile="${switch}.$(date +%m%d%y.%s).cfg"
+
+	xdsh $switch --devicetype EthSwitch::BNT "enable; copy running-config tftp://$ip/$bkfile"
+}
+
+if [ $force ]
+then
+    con "$NR" "$ip" 
+else
+    nodels "$NR" | while read node
+    do
+	con "$node" "$ip"
+    done
+fi
+
+ 
