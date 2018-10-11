@@ -1,0 +1,52 @@
+#!/bin/bash
+#
+# Tests IMM state
+#   Only Time is tested for now
+#
+[ -z "$1" ] && echo "$0 {node_range}" && exit 1
+
+export PATH=/opt/xcat/bin/:/ssg/bin/:$PATH
+
+nodels "$1" | while read NODE
+do
+    ( 
+        #Clocks are set using GMT
+        ipmitime="$(ipmitool-xcat -H $NODE-imm -U USERID -P PASSW0RD sel time get 2>&1)"
+	if [ $? -ne 0 ] 
+	then
+	    echo "IPMI: FAIL" 
+	else
+	    ipmitimestamp=$(date -u -d "$ipmitime" +%s)
+	    timestamp=$(date -u +%s)
+	    IFS=' ' read idate itime <<< "$ipmitime"
+	    IFS='/' read month day year <<< "$idate"
+	    IFS=':' read hour minute seconds <<< "$itime"
+	    #echo $month $day $year $hour $minute $seconds
+
+	    #this 
+	    awk \
+		    -vmonth=$month -vday=$day -vyear=$year -vhour=$hour -vminute=$minute -vseconds=$seconds \
+		    -vsmonth=$(date -u +%m) -vsday=$(date -u +%d) -vsyear=$(date -u +%Y) -vshour=$(date -u +%H) -vsminute=$(date -u +%M) -vsseconds=$(date -u +%S)  \
+		    -vtimestamp=$timestamp -vipmits=$ipmitimestamp \
+	    '
+	    function abs(v) {return v < 0 ? -v : v}
+	    BEGIN {
+
+		    fail=0
+		    tdiff=abs(timestamp - ipmits)
+		    if(smonth != month || syear != year || sday != day || shour != hour || tdiff > 90) fail=1
+
+		    if(fail == 1){
+			print "Fail "tdiff"s ("(syear - year)"yrs "(smonth-month)"mon "(sday-day)"day "(shour-hour)"hr "(sminute-minute)"min "(sseconds-seconds)"s)"
+		    }
+		    else{ 
+			print "PASS"
+		    }
+
+	    }'</dev/null
+
+	fi
+
+    ) | xargs -i echo "$NODE: {}"
+done
+

@@ -1,0 +1,19 @@
+#!/bin/bash
+# 
+# Uses IPMI tool to remotely set the IMPI clock and reset the bmc to take affect
+# Sets the time remotely with the time of the local system 
+#
+[ -z "$1" ] && echo "$0 {node_range}" && exit 1
+
+export PATH=/opt/xcat/bin/:/ssg/bin/:$PATH
+
+nodels "$1" | xargs -P0 -i \
+    bash -c "
+	#Clocks are set using GMT
+	(
+	ipmitool-xcat -H {}-imm -U USERID -P PASSW0RD sel time set \"$(date -u +"%m/%d/%Y %H:%M:%S")\"
+	ipmitool-xcat -H {}-imm -U USERID -P PASSW0RD sel clear
+	ipmitool-xcat -H {}-imm -U USERID -P PASSW0RD mc reset cold
+	) | xargs -i -I VV echo \"{}: VV\"
+    " 
+
